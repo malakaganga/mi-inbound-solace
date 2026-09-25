@@ -38,7 +38,7 @@
         <maven.compiler.target>11</maven.compiler.target>
         <sol.jcsmp.version>10.30.1</sol.jcsmp.version>
         <synapse.core.version>4.0.0-wso2v124</synapse.core.version>
-        <mi.inbound.endpoint.version>4.6.0</mi.inbound.endpoint.version>
+        <carbon.mediation.version>4.8.23-SNAPSHOT</carbon.mediation.version>
         <commons.logging.version>1.2</commons.logging.version>
         <commons.lang.version>2.6</commons.lang.version>
         <axis2.version>1.6.1-wso2v98</axis2.version>
@@ -81,18 +81,12 @@
             <scope>provided</scope>
         </dependency>
 
-        <!-- MI inbound endpoint framework (GenericEventBasedConsumer) -->
+        <!-- Carbon Mediation -->
         <dependency>
-            <groupId>org.wso2.ei</groupId>
-            <artifactId>org.wso2.micro.integrator.inbound.endpoint</artifactId>
-            <version>${mi.inbound.endpoint.version}</version>
+            <groupId>org.wso2.carbon.mediation</groupId>
+            <artifactId>org.wso2.carbon.inbound.endpoint</artifactId>
+            <version>${carbon.mediation.version}</version>
             <scope>provided</scope>
-            <exclusions>
-                <exclusion>
-                    <groupId>*</groupId>
-                    <artifactId>*</artifactId>
-                </exclusion>
-            </exclusions>
         </dependency>
 
         <!-- Apache Axis2 -->
