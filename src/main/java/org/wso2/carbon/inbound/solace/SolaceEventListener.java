@@ -731,23 +731,38 @@ public class SolaceEventListener extends GenericEventBasedConsumer implements XM
         if (!handled.compareAndSet(false, true)) {
             return;
         }
-        Thread recovery = new Thread(() -> {
-            try {
-                destroy();
-                log.info("SolaceListener [" + name + "] requesting a restart from the MI inbound framework.");
-                try {
-                    requestRelisten();
-                } catch (NoSuchMethodError e) {
-                    // MI versions without requestRelisten(): keep the previous behaviour, the listener
-                    // stays down until the inbound endpoint is re-activated.
-                    log.warn("SolaceListener [" + name + "] cannot be restarted automatically on this MI "
-                            + "version. Re-activate the inbound endpoint to resume consumption.");
-                }
-            } catch (Exception e) {
-                log.error("Error while recovering SolaceListener [" + name + "]", e);
-            }
-        }, "solace-recovery-" + name);
+        Thread recovery = new Thread(() -> recover(generation), "solace-recovery-" + name);
         recovery.setDaemon(true);
         recovery.start();
+    }
+
+    /**
+     * Recovery worker for a failed session: tears the listener down, then asks the MI inbound framework
+     * to listen again. The generation is re-checked under the listener monitor immediately before
+     * destroy(), as this thread may only get to run after a deactivate/activate cycle has already
+     * replaced the failed session with a healthy one, which must not be closed.
+     */
+    void recover(int generation) {
+        try {
+            synchronized (this) {
+                if (generation != sessionGeneration) {
+                    log.info("SolaceListener [" + name + "] failed session was already replaced, "
+                            + "no recovery needed.");
+                    return;
+                }
+                destroy();
+            }
+            log.info("SolaceListener [" + name + "] requesting a restart from the MI inbound framework.");
+            try {
+                requestRelisten();
+            } catch (NoSuchMethodError e) {
+                // MI versions without requestRelisten(): keep the previous behaviour, the listener
+                // stays down until the inbound endpoint is re-activated.
+                log.warn("SolaceListener [" + name + "] cannot be restarted automatically on this MI "
+                        + "version. Re-activate the inbound endpoint to resume consumption.");
+            }
+        } catch (Exception e) {
+            log.error("Error while recovering SolaceListener [" + name + "]", e);
+        }
     }
 }
