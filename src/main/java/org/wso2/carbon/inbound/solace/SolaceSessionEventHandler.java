@@ -30,12 +30,12 @@ import org.apache.commons.logging.LogFactory;
  *
  * <p>{@code RECONNECTING}/{@code RECONNECTED} are transient — JCSMP is recovering the connection
  * on its own — so they are logged only. {@code DOWN_ERROR} is terminal (the session has failed and
- * will not reconnect); on that event the supplied {@code onSessionDown} callback is invoked to tear
- * the listener down so the MI framework can trigger a resume. This complements the
+ * will not reconnect); on that event the supplied {@code onSessionDown} callback is invoked so the
+ * listener can tear itself down and ask the MI inbound framework to listen again. This complements the
  * {@code XMLMessageListener.onException} path: onException is JCSMP's documented signal for
  * permanent connection loss, but it is not guaranteed to fire for every terminal session-down case,
- * so reacting to DOWN_ERROR as well closes that gap. The listener's {@code destroy()} is idempotent,
- * so if both paths fire the second teardown is a harmless no-op.
+ * so reacting to DOWN_ERROR as well closes that gap. The listener handles a failure once, so if both
+ * paths fire the second is a no-op.
  */
 public class SolaceSessionEventHandler implements SessionEventHandler {
 
@@ -57,21 +57,8 @@ public class SolaceSessionEventHandler implements SessionEventHandler {
         } else if (event == SessionEvent.RECONNECTED) {
             log.info("SolaceListener [" + listenerName + "] session reconnected: " + eventArgs);
         } else if (event == SessionEvent.DOWN_ERROR) {
-            log.error("SolaceListener [" + listenerName + "] session DOWN (terminal): "
-                    + eventArgs + ". Tearing down listener for MI resume cycle.");
-            // handleEvent runs on a JCSMP callback thread. onSessionDown is the listener's
-            // destroy(), which calls session.closeSession() — closing the session from within
-            // its own callback thread can deadlock, so run the teardown on a daemon thread.
-            Thread teardown = new Thread(() -> {
-                try {
-                    onSessionDown.run();
-                } catch (Exception e) {
-                    log.error("Error while handling session DOWN_ERROR for listener ["
-                            + listenerName + "]", e);
-                }
-            }, "solace-sessiondown-" + listenerName);
-            teardown.setDaemon(true);
-            teardown.start();
+            log.error("SolaceListener [" + listenerName + "] session DOWN (terminal): " + eventArgs);
+            onSessionDown.run();
         } else if (log.isDebugEnabled()) {
             log.debug("SolaceListener [" + listenerName + "] session event: " + eventArgs);
         }

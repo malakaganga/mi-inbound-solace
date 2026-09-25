@@ -20,6 +20,7 @@ package org.wso2.carbon.inbound.solace;
 import com.solacesystems.jcsmp.FlowEvent;
 import com.solacesystems.jcsmp.FlowEventArgs;
 import com.solacesystems.jcsmp.FlowEventHandler;
+import com.solacesystems.jcsmp.JCSMPTransportException;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -35,11 +36,12 @@ import org.apache.commons.logging.LogFactory;
  *       so operators can diagnose "why is my node silent?".</li>
  *   <li>{@code FLOW_RECONNECTING} / {@code FLOW_RECONNECTED} — transient flow
  *       reconnect (distinct from session-level reconnect); logged at WARN/INFO.</li>
- *   <li>{@code FLOW_DOWN} — terminal (queue deleted, permission revoked,
- *       broker rejected the bind). The supplied {@code onFlowDown} callback is
- *       invoked on a separate daemon thread so the listener can tear itself down
- *       (closing the flow/session off the JCSMP callback thread) and let the MI
- *       framework trigger a resume.</li>
+ *   <li>{@code FLOW_DOWN} carrying a {@link JCSMPTransportException} — the channel dropped and JCSMP
+ *       is reconnecting the session, after which it re-binds the flow; logged at WARN only. If the
+ *       reconnect fails for good, JCSMP raises session {@code DOWN_ERROR}, which is handled as terminal.</li>
+ *   <li>Any other {@code FLOW_DOWN} — terminal (queue deleted, permission revoked, broker rejected the
+ *       bind). The supplied {@code onTerminalFailure} callback is invoked so the listener can tear
+ *       itself down and ask the MI inbound framework to listen again.</li>
  * </ul>
  */
 public class SolaceFlowEventHandler implements FlowEventHandler {
@@ -47,11 +49,11 @@ public class SolaceFlowEventHandler implements FlowEventHandler {
     private static final Log log = LogFactory.getLog(SolaceFlowEventHandler.class);
 
     private final String listenerName;
-    private final Runnable onFlowDown;
+    private final Runnable onTerminalFailure;
 
-    public SolaceFlowEventHandler(String listenerName, Runnable onFlowDown) {
+    public SolaceFlowEventHandler(String listenerName, Runnable onTerminalFailure) {
         this.listenerName = listenerName;
-        this.onFlowDown = onFlowDown;
+        this.onTerminalFailure = onTerminalFailure;
     }
 
     @Override
@@ -69,23 +71,13 @@ public class SolaceFlowEventHandler implements FlowEventHandler {
             log.warn("SolaceListener [" + listenerName + "] flow reconnecting: " + eventArgs);
         } else if (event == FlowEvent.FLOW_RECONNECTED) {
             log.info("SolaceListener [" + listenerName + "] flow reconnected: " + eventArgs);
+        } else if (event == FlowEvent.FLOW_DOWN
+                && eventArgs.getException() instanceof JCSMPTransportException) {
+            log.warn("SolaceListener [" + listenerName + "] flow DOWN while the session reconnects: "
+                    + eventArgs + ". JCSMP will re-bind the flow.");
         } else if (event == FlowEvent.FLOW_DOWN) {
-            log.error("SolaceListener [" + listenerName + "] flow DOWN (terminal): "
-                    + eventArgs + ". Tearing down listener for MI resume cycle.");
-            // Run on a daemon thread: closing a flow/session from within its own JCSMP
-            // callback thread can block.
-            Thread teardown = new Thread(() -> {
-                try {
-                    // onFlowDown is the listener's destroy(): closes the flow/session and
-                    // clears isConnected so the MI framework can resume the listener.
-                    onFlowDown.run();
-                } catch (Exception e) {
-                    log.error("Error while handling FLOW_DOWN for listener ["
-                            + listenerName + "]", e);
-                }
-            }, "solace-flowdown-" + listenerName);
-            teardown.setDaemon(true);
-            teardown.start();
+            log.error("SolaceListener [" + listenerName + "] flow DOWN (terminal): " + eventArgs);
+            onTerminalFailure.run();
         } else if (log.isDebugEnabled()) {
             log.debug("SolaceListener [" + listenerName + "] flow event: " + eventArgs);
         }
