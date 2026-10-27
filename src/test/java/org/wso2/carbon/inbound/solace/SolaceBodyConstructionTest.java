@@ -348,6 +348,39 @@ public class SolaceBodyConstructionTest {
     }
 
     @Test
+    public void aFormTextMessageKeepsItsDeclaredCharset() throws Exception {
+        String latin1 = "application/x-www-form-urlencoded; charset=ISO-8859-1";
+        MessageContext form = build(read(text(latin1, "name=caf%E9"), null));
+        assertLocations(form, "application/octet-stream", latin1);
+        assertEquals("ISO-8859-1", form.getProperty(Constants.Configuration.CHARACTER_SET_ENCODING));
+        assertArrayEquals("name=caf%E9".getBytes(StandardCharsets.ISO_8859_1), binary(form));
+
+        // The same form as bytes gives the same body.
+        MessageContext asBytes = build(read(bytes(latin1, "name=caf%E9".getBytes(StandardCharsets.US_ASCII)), null));
+        assertArrayEquals(binary(form), binary(asBytes));
+
+        // A charset inherited through the endpoint parameter is kept as well.
+        MessageContext inherited = build(read(text(latin1, "name=caf%E9"), "application/x-www-form-urlencoded"));
+        assertLocations(inherited, "application/octet-stream", latin1);
+
+        // With no charset the text is encoded as UTF-8 and the declaration gains nothing.
+        String plain = "application/x-www-form-urlencoded";
+        MessageContext utf8 = build(read(text(plain, "name=caf%C3%A9&v=\u00e9"), null));
+        assertLocations(utf8, "application/octet-stream", plain);
+        assertArrayEquals("name=caf%C3%A9&v=\u00e9".getBytes(StandardCharsets.UTF_8), binary(utf8));
+    }
+
+    @Test
+    public void aFormTextItsCharsetCannotEncodeFailsTheBuild() throws Exception {
+        try {
+            read(text("application/x-www-form-urlencoded; charset=ISO-8859-1", "name=\u540d"), null);
+            fail("a form text its charset cannot encode must fail the read");
+        } catch (CharacterCodingException expected) {
+            // The existing build failure path takes it, nothing is replaced.
+        }
+    }
+
+    @Test
     public void legacyBase64OptionKeepsTheTextBody() throws Exception {
         SolaceUtils.Payload payload = SolaceUtils.readPayload(environment,
                 bytes("application/json", new byte[] {1, 2, 3}), null, true, Collections.emptyMap());

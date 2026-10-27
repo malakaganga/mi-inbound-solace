@@ -222,8 +222,9 @@ public class SolaceUtils {
                 ((Axis2SynapseEnvironment) synapseEnvironment).getAxis2ConfigurationContext());
         String messageType;
         Builder builder;
-        if (HTTPConstants.MEDIA_TYPE_X_WWW_FORM.equals(baseType)
-                || HTTPConstants.MEDIA_TYPE_MULTIPART_FORM_DATA.equals(baseType)) {
+        boolean form = HTTPConstants.MEDIA_TYPE_X_WWW_FORM.equals(baseType)
+                || HTTPConstants.MEDIA_TYPE_MULTIPART_FORM_DATA.equals(baseType);
+        if (form) {
             // A form is carried as an opaque binary body. No field is parsed.
             messageType = SolaceInboundConstants.CONTENT_TYPE_OCTET;
             builder = BuilderUtil.getBuilderFromSelector(messageType, selection);
@@ -243,10 +244,13 @@ public class SolaceUtils {
 
         // Text the message carries as characters is always canonical UTF-8. A byte body is decoded when its
         // type is a character type or its builder reads characters. Any other byte body is never converted.
-        boolean text = isCharacterClass(message) || isCharacterType(baseType) || isCharacterBuilder(builder);
+        // A form is the exception. Its charset says how the percent encoded octets are read, so relabelling it
+        // would change the value. The text of a form is encoded with its own charset and the declaration stays.
+        boolean text = !form
+                && (isCharacterClass(message) || isCharacterType(baseType) || isCharacterBuilder(builder));
         byte[] bytes;
         if (characters != null) {
-            bytes = encodeUtf8(characters);
+            bytes = form ? encode(characters, charsetOf(resolved)) : encodeUtf8(characters);
         } else if (raw == null) {
             bytes = new byte[0];
         } else if (text) {
@@ -361,7 +365,15 @@ public class SolaceUtils {
      * Encodes text as UTF-8 with an encoder that reports what it cannot encode, such as a lone surrogate.
      */
     private static byte[] encodeUtf8(String text) throws CharacterCodingException {
-        ByteBuffer buffer = StandardCharsets.UTF_8.newEncoder()
+        return encode(text, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Encodes text with an encoder of the given charset that reports what it cannot encode. A failure is never
+     * replaced.
+     */
+    private static byte[] encode(String text, Charset charset) throws CharacterCodingException {
+        ByteBuffer buffer = charset.newEncoder()
                 .onMalformedInput(CodingErrorAction.REPORT)
                 .onUnmappableCharacter(CodingErrorAction.REPORT)
                 .encode(CharBuffer.wrap(text));
