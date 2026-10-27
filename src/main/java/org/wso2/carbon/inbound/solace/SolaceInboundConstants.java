@@ -123,6 +123,7 @@ public final class SolaceInboundConstants {
     // Content type values
     public static final String CONTENT_TYPE = "solace.contentType";
     public static final String CONTENT_TYPE_JSON = "application/json";
+    public static final String CONTENT_TYPE_JSON_BADGERFISH = "application/json/badgerfish";
     public static final String CONTENT_TYPE_XML = "application/xml";
     public static final String CONTENT_TYPE_TEXT_XML = "text/xml";
     public static final String CONTENT_TYPE_TEXT = "text/plain";

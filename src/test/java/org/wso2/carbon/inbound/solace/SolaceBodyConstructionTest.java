@@ -27,6 +27,7 @@ import com.solacesystems.jcsmp.XMLContentMessage;
 
 import org.apache.axiom.om.OMElement;
 import org.apache.axiom.om.OMException;
+import org.apache.axiom.om.OMOutputFormat;
 import org.apache.axiom.om.OMText;
 import org.apache.axis2.AxisFault;
 import org.apache.axis2.Constants;
@@ -35,19 +36,29 @@ import org.apache.axis2.context.ConfigurationContext;
 import org.apache.axis2.context.MessageContext;
 import org.apache.axis2.engine.AxisConfiguration;
 import org.apache.axis2.format.PlainTextBuilder;
+import org.apache.axis2.json.JSONBadgerfishMessageFormatter;
+import org.apache.axis2.json.JSONMessageFormatter;
+import org.apache.axis2.transport.MessageFormatter;
 import org.apache.synapse.commons.json.JsonUtil;
 import org.apache.synapse.config.SynapseConfiguration;
 import org.apache.synapse.core.SynapseEnvironment;
 import org.apache.synapse.core.axis2.Axis2MessageContext;
 import org.apache.synapse.core.axis2.Axis2SynapseEnvironment;
+import org.apache.synapse.transport.passthru.util.BinaryRelayBuilder;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import javax.activation.DataHandler;
 
 import static org.junit.Assert.assertArrayEquals;
@@ -68,6 +79,8 @@ public class SolaceBodyConstructionTest {
 
     private static final String PAYLOAD_NS = "http://ws.apache.org/commons/ns/payload";
 
+    private static final String BADGERFISH = "application/json/badgerfish";
+
     private static SynapseEnvironment environment;
 
     @BeforeClass
@@ -76,7 +89,12 @@ public class SolaceBodyConstructionTest {
     }
 
     private static SolaceUtils.Payload read(BytesXMLMessage message, String contentType) throws Exception {
-        return SolaceUtils.readPayload(message, contentType, false, Collections.emptyMap());
+        return read(environment, message, contentType);
+    }
+
+    private static SolaceUtils.Payload read(SynapseEnvironment in, BytesXMLMessage message, String contentType)
+            throws Exception {
+        return SolaceUtils.readPayload(in, message, contentType, false, Collections.emptyMap());
     }
 
     private static BytesMessage bytes(String declared, byte[] data) {
@@ -114,6 +132,59 @@ public class SolaceBodyConstructionTest {
         Map<?, ?> headers = (Map<?, ?>) context.getProperty(MessageContext.TRANSPORT_HEADERS);
         assertEquals(contentType, headers.get("Content-Type"));
         assertNull(context.getProperty(Constants.Configuration.XML_DECLARATION_ENCODING));
+    }
+
+    private static TextMessage text(String declared, String body) {
+        TextMessage message = FACTORY.createMessage(TextMessage.class);
+        message.setHTTPContentType(declared);
+        message.setText(body);
+        return message;
+    }
+
+    /**
+     * Reads and builds on a separate thread and returns the failure, null when there is none. A builder that
+     * never returns fails the test instead of hanging the suite. The thread is a daemon, so the test JVM
+     * still exits.
+     */
+    private static Throwable boundedReadAndBuild(BytesXMLMessage message) throws Exception {
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread worker = new Thread(() -> {
+            try {
+                build(read(message, null));
+            } catch (Throwable t) {
+                failure.set(t);
+            }
+        }, "boundedBuild");
+        worker.setDaemon(true);
+        worker.start();
+        worker.join(TimeUnit.SECONDS.toMillis(5));
+        assertFalse("the read and the build must return", worker.isAlive());
+        return failure.get();
+    }
+
+    private static SynapseEnvironment withTestTextType() throws Exception {
+        AxisConfiguration configuration = new AxisConfiguration();
+        configuration.addMessageBuilder("application/x-test", new PlainTextBuilder());
+        configuration.addMessageBuilder("application/octet-stream", new BinaryRelayBuilder());
+        return new Axis2SynapseEnvironment(new ConfigurationContext(configuration), new SynapseConfiguration());
+    }
+
+    /**
+     * The three locations for a body whose formatter appends the charset itself: ContentType without the
+     * charset, the transport header with it, and the charset in the character set encoding property.
+     */
+    private static void assertJsonFormatterLocations(MessageContext context, String messageType,
+                                                     String contentType) {
+        assertEquals(messageType, context.getProperty(Constants.Configuration.MESSAGE_TYPE));
+        assertEquals(SolaceUtils.withoutCharset(contentType),
+                context.getProperty(Constants.Configuration.CONTENT_TYPE));
+        assertEquals("UTF-8", context.getProperty(Constants.Configuration.CHARACTER_SET_ENCODING));
+        Map<?, ?> headers = (Map<?, ?>) context.getProperty(MessageContext.TRANSPORT_HEADERS);
+        assertEquals(contentType, headers.get("Content-Type"));
+    }
+
+    private static int charsetCount(String contentType) {
+        return contentType.toLowerCase(Locale.ROOT).split("charset=", -1).length - 1;
     }
 
     private static byte[] allBytes() {
@@ -239,9 +310,10 @@ public class SolaceBodyConstructionTest {
                 new SynapseConfiguration());
 
         org.apache.synapse.MessageContext context = SolaceUtils.createMessageContext(custom,
-                read(bytes("application/x-custom", "marker".getBytes(StandardCharsets.UTF_8)), null));
+                read(custom, bytes("application/x-custom", "marker".getBytes(StandardCharsets.UTF_8)), null));
         MessageContext axis2 = ((Axis2MessageContext) context).getAxis2MessageContext();
-        assertLocations(axis2, "application/x-custom", "application/x-custom");
+        // The plain text builder reads characters, so the bytes are decoded and declared as canonical UTF-8.
+        assertLocations(axis2, "application/x-custom", "application/x-custom; charset=UTF-8");
         assertEquals("marker", firstElement(axis2).getText());
     }
 
@@ -277,8 +349,8 @@ public class SolaceBodyConstructionTest {
 
     @Test
     public void legacyBase64OptionKeepsTheTextBody() throws Exception {
-        SolaceUtils.Payload payload = SolaceUtils.readPayload(bytes("application/json", new byte[] {1, 2, 3}),
-                null, true, Collections.emptyMap());
+        SolaceUtils.Payload payload = SolaceUtils.readPayload(environment,
+                bytes("application/json", new byte[] {1, 2, 3}), null, true, Collections.emptyMap());
         MessageContext context = build(payload);
         assertEquals("application/octet-stream", context.getProperty(Constants.Configuration.MESSAGE_TYPE));
         assertEquals("application/octet-stream", context.getProperty(Constants.Configuration.CONTENT_TYPE));
@@ -341,8 +413,8 @@ public class SolaceBodyConstructionTest {
     @Test
     public void noRegisteredBuilderFailsTheBuild() throws Exception {
         try {
-            SolaceUtils.createMessageContext(TestEnvironments.withoutBuilders(),
-                    read(bytes(null, new byte[] {1}), null));
+            SynapseEnvironment none = TestEnvironments.withoutBuilders();
+            SolaceUtils.createMessageContext(none, read(none, bytes(null, new byte[] {1}), null));
             fail("a pack without a builder for the type must fail the build");
         } catch (AxisFault expected) {
             assertTrue(expected.getMessage().contains("application/octet-stream"));
@@ -358,5 +430,138 @@ public class SolaceBodyConstructionTest {
         assertFalse(first.getEnvelope() == second.getEnvelope());
         assertEquals("same", firstElement(second).getText());
         assertEquals("same", firstElement(first).getText());
+    }
+
+    @Test
+    public void incompleteBadgerfishFailsTheBuildAndReturns() throws Exception {
+        byte[] complete = "{\"n\":{\"$\":\"café\"}}".getBytes(StandardCharsets.UTF_8);
+        // Every proper prefix is cut somewhere inside the value. A cut inside the two bytes of é fails the
+        // strict decoding, every other cut fails the JSON check. None reaches the legacy builder.
+        for (int length = 1; length < complete.length; length++) {
+            byte[] cut = Arrays.copyOf(complete, length);
+            Throwable failure = boundedReadAndBuild(bytes(BADGERFISH, cut));
+            assertTrue("cut at " + length + " must fail the build", failure instanceof IOException);
+        }
+        String[] incomplete = {"{\"n\"", "{\"p:n\"", "{\"n\"}", " {\"n\"", "{\"n\":1} {", "{\"n\":1}{\"m\":2}"};
+        for (String body : incomplete) {
+            assertTrue(body, boundedReadAndBuild(bytes(BADGERFISH, body.getBytes(StandardCharsets.UTF_8)))
+                    instanceof AxisFault);
+            assertTrue(body, boundedReadAndBuild(text(BADGERFISH, body)) instanceof AxisFault);
+        }
+        // Repeated failures leave nothing behind. The next valid delivery is built by the registered builder.
+        MessageContext next = build(read(bytes(BADGERFISH,
+                "{\"n\":{\"$\":\"ok\"}}".getBytes(StandardCharsets.UTF_8)), null));
+        assertEquals("n", firstElement(next).getLocalName());
+        assertEquals("ok", firstElement(next).getText());
+    }
+
+    @Test
+    public void validBadgerfishIsBuiltByItsRegisteredBuilderForEveryAttempt() throws Exception {
+        SolaceUtils.Payload payload = read(bytes(BADGERFISH,
+                "{\"n\":{\"$\":\"café\"}}".getBytes(StandardCharsets.UTF_8)), null);
+        assertNull(boundedReadAndBuild(bytes(BADGERFISH,
+                "{\"n\":{\"$\":\"café\"}}".getBytes(StandardCharsets.UTF_8))));
+        MessageContext first = build(payload);
+        MessageContext second = build(payload);
+        assertJsonFormatterLocations(first, BADGERFISH, BADGERFISH + "; charset=UTF-8");
+        assertEquals("n", firstElement(first).getLocalName());
+        assertEquals("café", firstElement(first).getText());
+        assertEquals("café", firstElement(second).getText());
+    }
+
+    @Test
+    public void textMessageUnderBadgerfishIsBuiltFromCanonicalUtf8() throws Exception {
+        MessageContext context = build(read(text(BADGERFISH + "; charset=ISO-8859-1",
+                "{\"n\":{\"$\":\"café\"}}"), null));
+        assertJsonFormatterLocations(context, BADGERFISH, BADGERFISH + "; charset=UTF-8");
+        assertEquals("café", firstElement(context).getText());
+    }
+
+    @Test
+    public void badgerfishBytesAreDecodedStrictly() throws Exception {
+        byte[] latin1 = "{\"n\":{\"$\":\"café\"}}".getBytes(StandardCharsets.ISO_8859_1);
+        MessageContext context = build(read(bytes(BADGERFISH + "; charset=ISO-8859-1", latin1), null));
+        assertJsonFormatterLocations(context, BADGERFISH, BADGERFISH + "; charset=UTF-8");
+        assertEquals("café", firstElement(context).getText());
+
+        byte[] replacement = "{\"n\":{\"$\":\"ok \uFFFD\"}}".getBytes(StandardCharsets.UTF_8);
+        assertEquals("ok \uFFFD", firstElement(build(read(bytes(BADGERFISH, replacement), null))).getText());
+
+        byte[] malformed = {'{', '"', 'n', '"', ':', '"', (byte) 0xC3, (byte) 0x28, '"', '}'};
+        try {
+            read(bytes(BADGERFISH, malformed), null);
+            fail("malformed UTF-8 must be reported");
+        } catch (CharacterCodingException expected) {
+            // The build fails. No replacement character reaches the sequence.
+        }
+    }
+
+    @Test
+    public void registeredCharacterBuilderGetsCanonicalUtf8() throws Exception {
+        SynapseEnvironment custom = withTestTextType();
+        String declared = "application/x-test; charset=ISO-8859-1";
+
+        MessageContext fromText = ((Axis2MessageContext) SolaceUtils.createMessageContext(custom,
+                read(custom, text(declared, "café"), null))).getAxis2MessageContext();
+        assertLocations(fromText, "application/x-test", "application/x-test; charset=UTF-8");
+        assertEquals("UTF-8", fromText.getProperty(Constants.Configuration.CHARACTER_SET_ENCODING));
+        assertEquals("café", firstElement(fromText).getText());
+
+        MessageContext fromBytes = ((Axis2MessageContext) SolaceUtils.createMessageContext(custom,
+                read(custom, bytes(declared, "café".getBytes(StandardCharsets.ISO_8859_1)), null)))
+                .getAxis2MessageContext();
+        assertLocations(fromBytes, "application/x-test", "application/x-test; charset=UTF-8");
+        assertEquals("UTF-8", fromBytes.getProperty(Constants.Configuration.CHARACTER_SET_ENCODING));
+        assertEquals("café", firstElement(fromBytes).getText());
+
+        try {
+            read(custom, bytes("application/x-test", new byte[] {'o', 'k', (byte) 0xC3, (byte) 0x28}), null);
+            fail("malformed UTF-8 must be reported");
+        } catch (CharacterCodingException expected) {
+            // Same disposition as malformed input of the text family.
+        }
+    }
+
+    @Test
+    public void textMessageUnderABinaryTypeIsDeclaredAsUtf8() throws Exception {
+        MessageContext context = build(read(text("application/octet-stream; charset=ISO-8859-1", "café"), null));
+        assertLocations(context, "application/octet-stream", "application/octet-stream; charset=UTF-8");
+        assertEquals("UTF-8", context.getProperty(Constants.Configuration.CHARACTER_SET_ENCODING));
+        assertArrayEquals("café".getBytes(StandardCharsets.UTF_8), binary(context));
+    }
+
+    @Test
+    public void bytesOfABinaryBuilderKeepTheirDeclaration() throws Exception {
+        byte[] data = allBytes();
+        MessageContext context = build(read(bytes("application/binary; charset=ISO-8859-1", data), null));
+        assertLocations(context, "application/binary", "application/binary; charset=ISO-8859-1");
+        assertEquals("ISO-8859-1", context.getProperty(Constants.Configuration.CHARACTER_SET_ENCODING));
+        assertArrayEquals(data, binary(context));
+    }
+
+    @Test
+    public void jsonFormattersWriteOneCharset() throws Exception {
+        String[][] cases = {
+                {"text/javascript", "text/javascript; charset=UTF-8"},
+                {"text/javascript; charset=ISO-8859-1", "text/javascript; charset=UTF-8"},
+                {"text/javascript; profile=x; charset=ISO-8859-1", "text/javascript; profile=x; charset=UTF-8"},
+                {BADGERFISH, BADGERFISH + "; charset=UTF-8"},
+                {BADGERFISH + "; charset=ISO-8859-1", BADGERFISH + "; charset=UTF-8"},
+                {BADGERFISH + "; profile=x", BADGERFISH + "; profile=x; charset=UTF-8"}};
+        for (String[] row : cases) {
+            String declared = row[0];
+            String body = declared.startsWith(BADGERFISH) ? "{\"n\":{\"$\":\"café\"}}" : "{\"n\":\"café\"}";
+            MessageContext context = build(read(bytes(declared, body.getBytes(SolaceUtils.charsetOf(declared))), null));
+            String messageType = SolaceUtils.baseType(declared);
+            assertJsonFormatterLocations(context, messageType, row[1]);
+
+            MessageFormatter formatter = messageType.equals(BADGERFISH)
+                    ? new JSONBadgerfishMessageFormatter() : new JSONMessageFormatter();
+            OMOutputFormat format = new OMOutputFormat();
+            format.setCharSetEncoding((String) context.getProperty(Constants.Configuration.CHARACTER_SET_ENCODING));
+            String written = formatter.getContentType(context, format, null);
+            assertEquals(declared, 1, charsetCount(written));
+            assertEquals(declared, row[1], written);
+        }
     }
 }

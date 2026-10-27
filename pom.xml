@@ -100,6 +100,13 @@
             <scope>provided</scope>
         </dependency>
 
+        <dependency>
+            <groupId>org.apache.axis2.wso2</groupId>
+            <artifactId>axis2-json</artifactId>
+            <version>${axis2.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
         <!-- Apache Axiom -->
         <dependency>
             <groupId>org.apache.ws.commons.axiom.wso2</groupId>

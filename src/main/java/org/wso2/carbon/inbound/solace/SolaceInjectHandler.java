@@ -37,7 +37,7 @@ import org.apache.synapse.core.SynapseEnvironment;
 import org.apache.synapse.mediators.MediatorFaultHandler;
 import org.apache.synapse.mediators.base.SequenceMediator;
 
-import java.nio.charset.CharacterCodingException;
+import java.io.IOException;
 import java.util.Base64;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -92,10 +92,11 @@ public class SolaceInjectHandler {
     /**
      * Worker thread. Reads the JCSMP message once per delivery, the body and the user properties, and returns
      * the snapshot every attempt builds its context from. Throws when a text body does not decode with its
-     * charset.
+     * charset, or when a legacy JSON builder would get a body that is not one complete JSON value.
      */
-    public SolaceUtils.Payload readPayload(BytesXMLMessage message) throws CharacterCodingException {
-        return SolaceUtils.readPayload(message, contentType, binaryPayloadAsBase64, readUserProperties(message));
+    public SolaceUtils.Payload readPayload(BytesXMLMessage message) throws IOException {
+        return SolaceUtils.readPayload(synapseEnvironment, message, contentType, binaryPayloadAsBase64,
+                readUserProperties(message));
     }
 
     /**

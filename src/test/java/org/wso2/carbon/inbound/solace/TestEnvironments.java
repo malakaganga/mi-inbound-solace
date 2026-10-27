@@ -23,6 +23,10 @@ import org.apache.axis2.context.ConfigurationContext;
 import org.apache.axis2.engine.AxisConfiguration;
 import org.apache.axis2.format.BinaryBuilder;
 import org.apache.axis2.format.PlainTextBuilder;
+import org.apache.axis2.json.JSONBadgerfishMessageFormatter;
+import org.apache.axis2.json.JSONBadgerfishOMBuilder;
+import org.apache.axis2.json.JSONBuilder;
+import org.apache.axis2.json.JSONMessageFormatter;
 import org.apache.synapse.commons.builders.XFormURLEncodedBuilder;
 import org.apache.synapse.commons.json.JsonStreamBuilder;
 import org.apache.synapse.config.SynapseConfiguration;
@@ -32,7 +36,8 @@ import org.apache.synapse.transport.passthru.util.BinaryRelayBuilder;
 
 /**
  * Synapse environments for the unit tests. One registers the builders a WSO2 Integrator: MI pack registers for
- * the family types, the other registers none.
+ * the family types and for the legacy JSON types, with the formatters of the legacy JSON types. The other
+ * registers none.
  */
 final class TestEnvironments {
 
@@ -47,6 +52,10 @@ final class TestEnvironments {
         configuration.addMessageBuilder("application/octet-stream", new BinaryRelayBuilder());
         configuration.addMessageBuilder("application/binary", new BinaryBuilder());
         configuration.addMessageBuilder("application/x-www-form-urlencoded", new XFormURLEncodedBuilder());
+        configuration.addMessageBuilder("application/json/badgerfish", new JSONBadgerfishOMBuilder());
+        configuration.addMessageBuilder("text/javascript", new JSONBuilder());
+        configuration.addMessageFormatter("application/json/badgerfish", new JSONBadgerfishMessageFormatter());
+        configuration.addMessageFormatter("text/javascript", new JSONMessageFormatter());
         return new Axis2SynapseEnvironment(new ConfigurationContext(configuration), new SynapseConfiguration());
     }
 

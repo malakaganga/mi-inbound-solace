@@ -66,7 +66,7 @@ public class SolacePayloadTest {
     }
 
     private static SolaceUtils.Payload read(BytesXMLMessage message, String contentType) throws Exception {
-        return SolaceUtils.readPayload(message, contentType, false, Collections.emptyMap());
+        return SolaceUtils.readPayload(environment, message, contentType, false, Collections.emptyMap());
     }
 
     private static BytesMessage bytes(String declared, byte[] data) {
@@ -230,7 +230,7 @@ public class SolacePayloadTest {
     @Test
     public void legacyBase64OptionIsUnchangedByTheCharset() throws Exception {
         BytesMessage message = bytes("text/plain; charset=no-such-charset", new byte[] {(byte) 0xC3, (byte) 0x28});
-        SolaceUtils.Payload payload = SolaceUtils.readPayload(message, "application/json", true,
+        SolaceUtils.Payload payload = SolaceUtils.readPayload(environment, message, "application/json", true,
                 Collections.emptyMap());
         assertTrue(payload.base64);
         assertEquals("application/octet-stream", payload.contentType);
@@ -241,7 +241,7 @@ public class SolacePayloadTest {
     public void legacyBase64OptionLeavesTextMessagesAlone() throws Exception {
         TextMessage message = FACTORY.createMessage(TextMessage.class);
         message.setText("hello");
-        SolaceUtils.Payload payload = SolaceUtils.readPayload(message, null, true, Collections.emptyMap());
+        SolaceUtils.Payload payload = SolaceUtils.readPayload(environment, message, null, true, Collections.emptyMap());
         assertFalse(payload.base64);
         assertEquals("text/plain", payload.contentType);
     }
@@ -363,5 +363,66 @@ public class SolacePayloadTest {
 
         SolaceInjectHandler legacy = handler(null, true);
         assertNull(legacy.buildContext(legacy.readPayload(emptyData), emptyData, 1));
+    }
+
+    @Test
+    public void escapedQuoteInAParameterDoesNotHideTheCharset() throws Exception {
+        String declared = "text/plain; profile=\"a\\\";b\"; charset=ISO-8859-1";
+        assertEquals("ISO-8859-1", SolaceUtils.charsetParameter(declared));
+        SolaceUtils.Payload payload = read(bytes(declared, "café".getBytes(StandardCharsets.ISO_8859_1)), null);
+        assertArrayEquals("café".getBytes(StandardCharsets.UTF_8), payload.bytes);
+        assertEquals("text/plain; profile=\"a\\\";b\"; charset=UTF-8",
+                SolaceUtils.canonicalTextType(payload.contentType));
+    }
+
+    @Test
+    public void semicolonInsideQuotesIsNotASeparator() throws Exception {
+        String declared = "text/plain; title=\"x;charset=UTF-16\"; charset=ISO-8859-1";
+        assertEquals("ISO-8859-1", SolaceUtils.charsetParameter(declared));
+        assertArrayEquals("café".getBytes(StandardCharsets.UTF_8),
+                read(bytes(declared, "café".getBytes(StandardCharsets.ISO_8859_1)), null).bytes);
+
+        String quotedOnly = "text/plain; title=\"x;charset=UTF-16\"";
+        assertNull(SolaceUtils.charsetParameter(quotedOnly));
+        assertEquals("text/plain; title=\"x;charset=UTF-16\"; charset=UTF-8",
+                SolaceUtils.canonicalTextType(quotedOnly));
+    }
+
+    @Test
+    public void escapedBackslashEndsTheQuotedValue() throws Exception {
+        String declared = "text/plain; path=\"a\\\\\"; charset=ISO-8859-1";
+        assertEquals("ISO-8859-1", SolaceUtils.charsetParameter(declared));
+        assertEquals("text/plain; path=\"a\\\\\"; charset=UTF-8", SolaceUtils.canonicalTextType(declared));
+    }
+
+    @Test
+    public void charsetNameIsCaseInsensitiveAndAQuotedValueIsUnquoted() throws Exception {
+        byte[] latin1 = "café".getBytes(StandardCharsets.ISO_8859_1);
+        byte[] utf8 = "café".getBytes(StandardCharsets.UTF_8);
+        assertEquals("iso-8859-1", SolaceUtils.charsetParameter("text/plain; ChArSeT=iso-8859-1"));
+        assertArrayEquals(utf8, read(bytes("text/plain; ChArSeT=iso-8859-1", latin1), null).bytes);
+        assertEquals("ISO-8859-1", SolaceUtils.charsetParameter("text/plain; charset=\"ISO-8859-1\""));
+        assertArrayEquals(utf8, read(bytes("text/plain; charset=\"ISO-8859-1\"", latin1), null).bytes);
+        assertEquals("ISO-8859-1", SolaceUtils.charsetParameter("text/plain; charset=\"ISO\\-8859-1\""));
+        assertEquals("text/plain; format=flowed; charset=UTF-8",
+                SolaceUtils.canonicalTextType("text/plain; CHARSET=\"ISO-8859-1\"; format=flowed"));
+    }
+
+    @Test
+    public void overrideUsesTheSameParameterParser() throws Exception {
+        byte[] latin1 = "café".getBytes(StandardCharsets.ISO_8859_1);
+        String profile = "text/plain; profile=\"a\\\";b\"";
+        SolaceUtils.Payload inherited = read(bytes("text/plain; charset=ISO-8859-1", latin1), profile);
+        assertEquals(profile + "; charset=ISO-8859-1", inherited.contentType);
+        assertArrayEquals("café".getBytes(StandardCharsets.UTF_8), inherited.bytes);
+
+        String quotedSemicolon = "text/plain; title=\"x;charset=UTF-16\"";
+        assertEquals(quotedSemicolon + "; charset=ISO-8859-1",
+                read(bytes("text/plain; charset=ISO-8859-1", latin1), quotedSemicolon).contentType);
+
+        String ownCharset = "text/plain; charset=\"ISO-8859-1\"";
+        SolaceUtils.Payload own = read(bytes("text/plain; profile=\"a\\\";b\"; charset=UTF-8", latin1), ownCharset);
+        assertEquals(ownCharset, own.contentType);
+        assertArrayEquals("café".getBytes(StandardCharsets.UTF_8), own.bytes);
     }
 }

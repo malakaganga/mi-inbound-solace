@@ -17,6 +17,9 @@
  */
 package org.wso2.carbon.inbound.solace;
 
+import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonToken;
+import com.google.gson.stream.MalformedJsonException;
 import com.solacesystems.jcsmp.BytesMessage;
 import com.solacesystems.jcsmp.BytesXMLMessage;
 import com.solacesystems.jcsmp.MapMessage;
@@ -39,6 +42,9 @@ import org.apache.axis2.builder.Builder;
 import org.apache.axis2.builder.BuilderUtil;
 import org.apache.axis2.context.MessageContext;
 import org.apache.axis2.format.DataSourceMessageBuilder;
+import org.apache.axis2.json.AbstractJSONMessageFormatter;
+import org.apache.axis2.json.AbstractJSONOMBuilder;
+import org.apache.axis2.transport.MessageFormatter;
 import org.apache.axis2.transport.TransportUtils;
 import org.apache.axis2.transport.http.HTTPConstants;
 import org.apache.commons.lang.StringUtils;
@@ -47,10 +53,13 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.synapse.SynapseException;
 import org.apache.synapse.core.SynapseEnvironment;
 import org.apache.synapse.core.axis2.Axis2MessageContext;
+import org.apache.synapse.core.axis2.Axis2SynapseEnvironment;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
 import java.nio.ByteBuffer;
 import java.nio.CharBuffer;
 import java.nio.charset.CharacterCodingException;
@@ -63,12 +72,30 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 public class SolaceUtils {
 
     private static final Log log = LogFactory.getLog(SolaceUtils.class);
 
     private static final String CHARSET = "charset";
+
+    /**
+     * The stock builders that read characters: the plain text, XML and JSON builders. A subclass of one of
+     * them reads characters too. We compare class names because the JSON builder of WSO2 Integrator: MI is
+     * not on the compile path of the inbound.
+     */
+    private static final Set<String> CHARACTER_BUILDERS = Set.of(
+            "org.apache.axis2.format.PlainTextBuilder",
+            "org.apache.axis2.builder.ApplicationXMLBuilder",
+            "org.apache.axis2.builder.SOAPBuilder",
+            "org.apache.axis2.json.AbstractJSONOMBuilder",
+            "org.apache.axis2.json.JSONBuilder",
+            "org.apache.axis2.json.JSONStreamBuilder",
+            "org.apache.axis2.json.gson.JsonBuilder",
+            "org.apache.synapse.commons.json.JsonBuilder",
+            "org.apache.synapse.commons.json.JsonStreamBuilder",
+            "org.wso2.micro.integrator.core.json.JsonStreamBuilder");
 
     private SolaceUtils() {
         // Utility class
@@ -96,14 +123,26 @@ public class SolaceUtils {
         /** True when binaryPayloadAsBase64 made a byte body into base64 text, the legacy option. */
         final boolean base64;
 
+        /** The builder key the body is built with. Null for the legacy base64 body. */
+        final String messageType;
+
+        /**
+         * The builder registered for the message type, selected once for the delivery. Null when none is
+         * registered, or for the legacy base64 body.
+         */
+        final Builder builder;
+
         /** The user properties as the sequence reads them, in the order of the message. */
         final Map<String, String> userProperties;
 
-        Payload(byte[] bytes, String contentType, boolean text, boolean base64, Map<String, String> userProperties) {
+        Payload(byte[] bytes, String contentType, boolean text, boolean base64, String messageType, Builder builder,
+                Map<String, String> userProperties) {
             this.bytes = bytes;
             this.contentType = contentType;
             this.text = text;
             this.base64 = base64;
+            this.messageType = messageType;
+            this.builder = builder;
             this.userProperties = userProperties;
         }
 
@@ -113,19 +152,23 @@ public class SolaceUtils {
     }
 
     /**
-     * Reads the JCSMP message once and returns the snapshot of the delivery. A text body is decoded with the
-     * charset of its content type and held as canonical UTF-8. A binary body is held as the bytes it has.
-     * Throws when a text body does not decode with its charset, when the charset is unknown, or when the
-     * text has characters that UTF-8 cannot carry. Nothing is ever replaced.
+     * Reads the JCSMP message once and returns the snapshot of the delivery. The builder of the content type
+     * is selected here, once for the delivery. Text a message carries as characters is held as canonical
+     * UTF-8. A byte body of a character type is decoded with the charset of its content type and held as
+     * canonical UTF-8. Any other byte body is held as the bytes it has.
+     * Throws when a byte body does not decode with its charset, when the charset is unknown, when the text
+     * has characters that UTF-8 cannot carry, or when a legacy JSON builder would get a body that is not one
+     * complete JSON value. Nothing is ever replaced.
      *
+     * @param synapseEnvironment    the environment whose registered builders build the body
      * @param message               the Solace message
      * @param contentTypeParameter  the endpoint's contentType parameter. Blank counts as absent.
      * @param binaryPayloadAsBase64 when true a byte body becomes base64 text, as 2.0.0 did
      * @param userProperties        the user properties of the message, already read
      */
-    public static Payload readPayload(BytesXMLMessage message, String contentTypeParameter,
-                                      boolean binaryPayloadAsBase64, Map<String, String> userProperties)
-            throws CharacterCodingException {
+    public static Payload readPayload(SynapseEnvironment synapseEnvironment, BytesXMLMessage message,
+                                      String contentTypeParameter, boolean binaryPayloadAsBase64,
+                                      Map<String, String> userProperties) throws IOException {
         String characters = null;
         byte[] raw = null;
         String classDefault;
@@ -158,7 +201,8 @@ public class SolaceUtils {
         if (binaryPayloadAsBase64 && !isCharacterClass(message)) {
             byte[] base64 = raw == null ? new byte[0]
                     : Base64.getEncoder().encodeToString(raw).getBytes(StandardCharsets.US_ASCII);
-            return new Payload(base64, SolaceInboundConstants.CONTENT_TYPE_OCTET, false, true, userProperties);
+            return new Payload(base64, SolaceInboundConstants.CONTENT_TYPE_OCTET, false, true, null, null,
+                    userProperties);
         }
 
         String declared = StringUtils.isNotBlank(message.getHTTPContentType())
@@ -172,7 +216,34 @@ public class SolaceUtils {
             resolved = classDefault;
         }
 
-        boolean text = isTextType(baseType(resolved));
+        String baseType = baseType(resolved);
+        MessageContext selection = new MessageContext();
+        selection.setConfigurationContext(
+                ((Axis2SynapseEnvironment) synapseEnvironment).getAxis2ConfigurationContext());
+        String messageType;
+        Builder builder;
+        if (HTTPConstants.MEDIA_TYPE_X_WWW_FORM.equals(baseType)
+                || HTTPConstants.MEDIA_TYPE_MULTIPART_FORM_DATA.equals(baseType)) {
+            // A form is carried as an opaque binary body. No field is parsed.
+            messageType = SolaceInboundConstants.CONTENT_TYPE_OCTET;
+            builder = BuilderUtil.getBuilderFromSelector(messageType, selection);
+        } else if (HTTPConstants.MEDIA_TYPE_TEXT_XML.equals(baseType)
+                || HTTPConstants.MEDIA_TYPE_APPLICATION_SOAP_XML.equals(baseType)) {
+            // The SOAP types are built by the XML builder. The received document goes into the body as it is.
+            messageType = SolaceInboundConstants.CONTENT_TYPE_XML;
+            builder = BuilderUtil.getBuilderFromSelector(messageType, selection);
+        } else {
+            messageType = baseType;
+            builder = BuilderUtil.getBuilderFromSelector(messageType, selection);
+            if (builder == null) {
+                messageType = familyFallback(baseType);
+                builder = BuilderUtil.getBuilderFromSelector(messageType, selection);
+            }
+        }
+
+        // Text the message carries as characters is always canonical UTF-8. A byte body is decoded when its
+        // type is a character type or its builder reads characters. Any other byte body is never converted.
+        boolean text = isCharacterClass(message) || isCharacterType(baseType) || isCharacterBuilder(builder);
         byte[] bytes;
         if (characters != null) {
             bytes = encodeUtf8(characters);
@@ -183,7 +254,10 @@ public class SolaceUtils {
         } else {
             bytes = raw;
         }
-        return new Payload(bytes, resolved, text, false, userProperties);
+        if (builder instanceof AbstractJSONOMBuilder && bytes.length > 0) {
+            checkCompleteJson(bytes, resolved);
+        }
+        return new Payload(bytes, resolved, text, false, messageType, builder, userProperties);
     }
 
     private static boolean isCharacterClass(BytesXMLMessage message) {
@@ -209,14 +283,47 @@ public class SolaceUtils {
     }
 
     /**
-     * Text is text/*, the JSON family and the XML family. Every other type is a binary body.
+     * A character type is a text/* type, text/javascript among them, a type of the JSON or the XML family,
+     * or application/json/badgerfish.
      */
-    static boolean isTextType(String baseType) {
+    static boolean isCharacterType(String baseType) {
         return baseType.startsWith("text/")
                 || SolaceInboundConstants.CONTENT_TYPE_JSON.equals(baseType)
                 || SolaceInboundConstants.CONTENT_TYPE_XML.equals(baseType)
                 || baseType.endsWith("+json")
-                || baseType.endsWith("+xml");
+                || baseType.endsWith("+xml")
+                || SolaceInboundConstants.CONTENT_TYPE_JSON_BADGERFISH.equals(baseType);
+    }
+
+    /**
+     * True when the builder is one of the stock character builders or a subclass of one.
+     */
+    static boolean isCharacterBuilder(Builder builder) {
+        for (Class<?> type = builder == null ? null : builder.getClass(); type != null;
+             type = type.getSuperclass()) {
+            if (CHARACTER_BUILDERS.contains(type.getName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The legacy JSON builders scan the body for the first property name and do not stop at the end of an
+     * incomplete body. So before such a builder is called we parse the body once with a finite parse. It must
+     * be one complete JSON value with nothing after it. A failure fails the build.
+     */
+    private static void checkCompleteJson(byte[] bytes, String contentType) throws AxisFault {
+        try (JsonReader reader = new JsonReader(
+                new InputStreamReader(new ByteArrayInputStream(bytes), StandardCharsets.UTF_8))) {
+            reader.skipValue();
+            if (reader.peek() != JsonToken.END_DOCUMENT) {
+                throw new MalformedJsonException("Content follows the JSON value");
+            }
+        } catch (IOException e) {
+            throw new AxisFault("The body of content type " + contentType
+                    + " is not one complete JSON value, so the legacy JSON builder is not called", e);
+        }
     }
 
     /**
@@ -279,18 +386,15 @@ public class SolaceUtils {
     }
 
     /**
-     * The value of the first charset parameter that has one, without quotes. Null when there is none.
+     * The value of the first charset parameter that has one, unquoted. The parameter name compares case
+     * insensitively. Null when there is none.
      */
     static String charsetParameter(String contentType) {
         List<String> parts = parts(contentType);
         for (int i = 1; i < parts.size(); i++) {
-            String parameter = parts.get(i).trim();
-            int eq = parameter.indexOf('=');
-            if (eq > 0 && CHARSET.equalsIgnoreCase(parameter.substring(0, eq).trim())) {
-                String name = parameter.substring(eq + 1).trim();
-                if (name.length() >= 2 && name.startsWith("\"") && name.endsWith("\"")) {
-                    name = name.substring(1, name.length() - 1).trim();
-                }
+            String parameter = parts.get(i);
+            if (isCharset(parameter)) {
+                String name = parameterValue(parameter).trim();
                 if (!name.isEmpty()) {
                     return name;
                 }
@@ -304,21 +408,58 @@ public class SolaceUtils {
      * charset=UTF-8. A content type never carries two charset parameters.
      */
     static String canonicalTextType(String contentType) {
-        List<String> parts = parts(contentType);
-        StringBuilder canonical = new StringBuilder(parts.get(0).trim());
-        for (int i = 1; i < parts.size(); i++) {
-            String parameter = parts.get(i).trim();
-            int eq = parameter.indexOf('=');
-            if (parameter.isEmpty() || (eq > 0 && CHARSET.equalsIgnoreCase(parameter.substring(0, eq).trim()))) {
-                continue;
-            }
-            canonical.append("; ").append(parameter);
-        }
-        return canonical.append("; ").append(CHARSET).append('=').append(StandardCharsets.UTF_8.name()).toString();
+        return withoutCharset(contentType) + "; " + CHARSET + "=" + StandardCharsets.UTF_8.name();
     }
 
     /**
-     * Splits a content type at the semicolons that are outside quotes. The first part is the base type.
+     * The content type without its charset parameters. The base type and the other parameters stay as
+     * written.
+     */
+    static String withoutCharset(String contentType) {
+        List<String> parts = parts(contentType);
+        StringBuilder type = new StringBuilder(parts.get(0).trim());
+        for (int i = 1; i < parts.size(); i++) {
+            String parameter = parts.get(i).trim();
+            if (!parameter.isEmpty() && !isCharset(parameter)) {
+                type.append("; ").append(parameter);
+            }
+        }
+        return type.toString();
+    }
+
+    private static boolean isCharset(String parameter) {
+        int eq = parameter.indexOf('=');
+        return eq > 0 && CHARSET.equalsIgnoreCase(parameter.substring(0, eq).trim());
+    }
+
+    /**
+     * The value of a parameter. A token is taken as written. A quoted string loses its quotes, and a
+     * backslash inside it stands for the character after it.
+     */
+    private static String parameterValue(String parameter) {
+        String value = parameter.substring(parameter.indexOf('=') + 1).trim();
+        if (!value.startsWith("\"")) {
+            return value;
+        }
+        StringBuilder unquoted = new StringBuilder();
+        for (int i = 1; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c == '\\' && i + 1 < value.length()) {
+                unquoted.append(value.charAt(++i));
+            } else if (c == '"') {
+                break;
+            } else {
+                unquoted.append(c);
+            }
+        }
+        return unquoted.toString();
+    }
+
+    /**
+     * Splits a content type at the semicolons that separate its parameters. We follow the quoted string rules
+     * of RFC 9110. Inside quotes a backslash escapes the next character, so an escaped quote does not end the
+     * value and an escaped backslash does not escape what follows it. A semicolon inside quotes is part of
+     * the value. Each part keeps its text as written. The first part is the base type.
      */
     private static List<String> parts(String contentType) {
         List<String> parts = new ArrayList<>();
@@ -326,6 +467,10 @@ public class SolaceUtils {
         boolean quoted = false;
         for (int i = 0; i < contentType.length(); i++) {
             char c = contentType.charAt(i);
+            if (quoted && c == '\\' && i + 1 < contentType.length()) {
+                current.append(c).append(contentType.charAt(++i));
+                continue;
+            }
             if (c == '"') {
                 quoted = !quoted;
             } else if (c == ';' && !quoted) {
@@ -341,8 +486,8 @@ public class SolaceUtils {
 
     /**
      * Creates a fresh Synapse MessageContext from the snapshot of the delivery. The body is built by the
-     * builder registered for its content type, the way the file inbound builds a file. Each call gets its
-     * own reader over the snapshot, so no stream is shared between attempts.
+     * builder the snapshot selected for its content type, the way the file inbound builds a file. Each call
+     * gets its own reader over the snapshot, so no stream is shared between attempts.
      */
     public static org.apache.synapse.MessageContext createMessageContext(
             SynapseEnvironment synapseEnvironment, Payload payload) throws AxisFault {
@@ -363,7 +508,6 @@ public class SolaceUtils {
             return synCtx;
         }
 
-        String baseType = baseType(payload.contentType);
         // The builder gets a declaration that matches the bytes. Text is canonical UTF-8. A binary body keeps
         // the type and the parameters it was read with.
         String contentType = payload.text ? canonicalTextType(payload.contentType) : payload.contentType;
@@ -372,26 +516,8 @@ public class SolaceUtils {
             axis2MsgCtx.setProperty(Constants.Configuration.CHARACTER_SET_ENCODING, charset);
         }
 
-        String messageType;
-        Builder builder;
-        if (HTTPConstants.MEDIA_TYPE_X_WWW_FORM.equals(baseType)
-                || HTTPConstants.MEDIA_TYPE_MULTIPART_FORM_DATA.equals(baseType)) {
-            // A form is carried as an opaque binary body. No field is parsed.
-            messageType = SolaceInboundConstants.CONTENT_TYPE_OCTET;
-            builder = BuilderUtil.getBuilderFromSelector(messageType, axis2MsgCtx);
-        } else if (HTTPConstants.MEDIA_TYPE_TEXT_XML.equals(baseType)
-                || HTTPConstants.MEDIA_TYPE_APPLICATION_SOAP_XML.equals(baseType)) {
-            // The SOAP types are built by the XML builder. The received document goes into the body as it is.
-            messageType = SolaceInboundConstants.CONTENT_TYPE_XML;
-            builder = BuilderUtil.getBuilderFromSelector(messageType, axis2MsgCtx);
-        } else {
-            messageType = baseType;
-            builder = BuilderUtil.getBuilderFromSelector(messageType, axis2MsgCtx);
-            if (builder == null) {
-                messageType = familyFallback(baseType);
-                builder = BuilderUtil.getBuilderFromSelector(messageType, axis2MsgCtx);
-            }
-        }
+        String messageType = payload.messageType;
+        Builder builder = payload.builder;
         if (builder == null) {
             throw new AxisFault("No message builder is registered for " + messageType
                     + ", the type used for the content type " + payload.contentType);
@@ -412,9 +538,14 @@ public class SolaceUtils {
         synCtx.setEnvelope(TransportUtils.createSOAPEnvelope(documentElement));
 
         // The content type lives in three places and all three describe the built body. The charset is in
-        // ContentType already, so no platform path may append a second one.
+        // ContentType already, so no platform path may append a second one. The stock JSON formatters append
+        // the charset whatever setCharacterEncoding says. For them ContentType has no charset parameter, the
+        // charset stays in the character set encoding property and the formatter writes it once.
+        MessageFormatter formatter = axis2MsgCtx.getConfigurationContext().getAxisConfiguration()
+                .getMessageFormatter(messageType);
         axis2MsgCtx.setProperty(Constants.Configuration.MESSAGE_TYPE, messageType);
-        axis2MsgCtx.setProperty(Constants.Configuration.CONTENT_TYPE, contentType);
+        axis2MsgCtx.setProperty(Constants.Configuration.CONTENT_TYPE,
+                formatter instanceof AbstractJSONMessageFormatter ? withoutCharset(contentType) : contentType);
         axis2MsgCtx.setProperty(Constants.Configuration.SET_CONTENT_TYPE_CHARACTER_ENCODING, "false");
         transportHeaders.keySet().removeIf(HTTPConstants.HEADER_CONTENT_TYPE::equalsIgnoreCase);
         transportHeaders.put(HTTPConstants.HEADER_CONTENT_TYPE, contentType);
