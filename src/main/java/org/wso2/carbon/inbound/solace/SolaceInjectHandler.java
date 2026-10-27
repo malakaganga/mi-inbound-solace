@@ -99,6 +99,7 @@ public class SolaceInjectHandler {
 
         // Names the mediation flow's entry span after the inbound endpoint.
         synCtx.setProperty(SynapseConstants.INBOUND_ENDPOINT_NAME, inboundEndpointName);
+        synCtx.setProperty(SynapseConstants.IS_INBOUND, true);
 
         if (RuntimeStatisticCollector.isOpenTelemetryEnabled()) {
             try {
