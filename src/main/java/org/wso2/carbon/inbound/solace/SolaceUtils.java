@@ -42,9 +42,7 @@ import org.apache.axis2.builder.Builder;
 import org.apache.axis2.builder.BuilderUtil;
 import org.apache.axis2.context.MessageContext;
 import org.apache.axis2.format.DataSourceMessageBuilder;
-import org.apache.axis2.json.AbstractJSONMessageFormatter;
 import org.apache.axis2.json.AbstractJSONOMBuilder;
-import org.apache.axis2.transport.MessageFormatter;
 import org.apache.axis2.transport.TransportUtils;
 import org.apache.axis2.transport.http.HTTPConstants;
 import org.apache.commons.lang.StringUtils;
@@ -550,14 +548,10 @@ public class SolaceUtils {
         synCtx.setEnvelope(TransportUtils.createSOAPEnvelope(documentElement));
 
         // The content type lives in three places and all three describe the built body. The charset is in
-        // ContentType already, so no platform path may append a second one. The stock JSON formatters append
-        // the charset whatever setCharacterEncoding says. For them ContentType has no charset parameter, the
-        // charset stays in the character set encoding property and the formatter writes it once.
-        MessageFormatter formatter = axis2MsgCtx.getConfigurationContext().getAxisConfiguration()
-                .getMessageFormatter(messageType);
+        // ContentType already. With setCharacterEncoding false the HTTP paths that read ContentType send it as
+        // it is, with no second charset.
         axis2MsgCtx.setProperty(Constants.Configuration.MESSAGE_TYPE, messageType);
-        axis2MsgCtx.setProperty(Constants.Configuration.CONTENT_TYPE,
-                formatter instanceof AbstractJSONMessageFormatter ? withoutCharset(contentType) : contentType);
+        axis2MsgCtx.setProperty(Constants.Configuration.CONTENT_TYPE, contentType);
         axis2MsgCtx.setProperty(Constants.Configuration.SET_CONTENT_TYPE_CHARACTER_ENCODING, "false");
         transportHeaders.keySet().removeIf(HTTPConstants.HEADER_CONTENT_TYPE::equalsIgnoreCase);
         transportHeaders.put(HTTPConstants.HEADER_CONTENT_TYPE, contentType);

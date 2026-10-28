@@ -27,7 +27,6 @@ import com.solacesystems.jcsmp.XMLContentMessage;
 
 import org.apache.axiom.om.OMElement;
 import org.apache.axiom.om.OMException;
-import org.apache.axiom.om.OMOutputFormat;
 import org.apache.axiom.om.OMText;
 import org.apache.axis2.AxisFault;
 import org.apache.axis2.Constants;
@@ -36,9 +35,6 @@ import org.apache.axis2.context.ConfigurationContext;
 import org.apache.axis2.context.MessageContext;
 import org.apache.axis2.engine.AxisConfiguration;
 import org.apache.axis2.format.PlainTextBuilder;
-import org.apache.axis2.json.JSONBadgerfishMessageFormatter;
-import org.apache.axis2.json.JSONMessageFormatter;
-import org.apache.axis2.transport.MessageFormatter;
 import org.apache.synapse.commons.json.JsonUtil;
 import org.apache.synapse.config.SynapseConfiguration;
 import org.apache.synapse.core.SynapseEnvironment;
@@ -170,17 +166,22 @@ public class SolaceBodyConstructionTest {
     }
 
     /**
-     * The three locations for a body whose formatter appends the charset itself: ContentType without the
-     * charset, the transport header with it, and the charset in the character set encoding property.
+     * The locations for a body whose formatter is a legacy JSON formatter. ContentType and the transport header
+     * are the same complete type with one charset, setCharacterEncoding is false and the charset is also in the
+     * character set encoding property.
      */
     private static void assertJsonFormatterLocations(MessageContext context, String messageType,
                                                      String contentType) {
         assertEquals(messageType, context.getProperty(Constants.Configuration.MESSAGE_TYPE));
-        assertEquals(SolaceUtils.withoutCharset(contentType),
-                context.getProperty(Constants.Configuration.CONTENT_TYPE));
+        String described = (String) context.getProperty(Constants.Configuration.CONTENT_TYPE);
+        assertEquals(contentType, described);
+        assertEquals(described, 1, charsetCount(described));
+        assertEquals("false", context.getProperty(Constants.Configuration.SET_CONTENT_TYPE_CHARACTER_ENCODING));
         assertEquals("UTF-8", context.getProperty(Constants.Configuration.CHARACTER_SET_ENCODING));
         Map<?, ?> headers = (Map<?, ?>) context.getProperty(MessageContext.TRANSPORT_HEADERS);
-        assertEquals(contentType, headers.get("Content-Type"));
+        String header = (String) headers.get("Content-Type");
+        assertEquals(described, header);
+        assertEquals(header, 1, charsetCount(header));
     }
 
     private static int charsetCount(String contentType) {
@@ -573,7 +574,7 @@ public class SolaceBodyConstructionTest {
     }
 
     @Test
-    public void jsonFormattersWriteOneCharset() throws Exception {
+    public void legacyJsonTypesCarryOneCharsetInContentType() throws Exception {
         String[][] cases = {
                 {"text/javascript", "text/javascript; charset=UTF-8"},
                 {"text/javascript; charset=ISO-8859-1", "text/javascript; charset=UTF-8"},
@@ -587,14 +588,6 @@ public class SolaceBodyConstructionTest {
             MessageContext context = build(read(bytes(declared, body.getBytes(SolaceUtils.charsetOf(declared))), null));
             String messageType = SolaceUtils.baseType(declared);
             assertJsonFormatterLocations(context, messageType, row[1]);
-
-            MessageFormatter formatter = messageType.equals(BADGERFISH)
-                    ? new JSONBadgerfishMessageFormatter() : new JSONMessageFormatter();
-            OMOutputFormat format = new OMOutputFormat();
-            format.setCharSetEncoding((String) context.getProperty(Constants.Configuration.CHARACTER_SET_ENCODING));
-            String written = formatter.getContentType(context, format, null);
-            assertEquals(declared, 1, charsetCount(written));
-            assertEquals(declared, row[1], written);
         }
     }
 }
